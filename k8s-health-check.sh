@@ -19,17 +19,6 @@ print_status() {
     fi
 }
 
-# 检查函数
-check_status() {
-    if [ $? -eq 0 ]; then
-        print_status "success" "$1 正常"
-        return 0
-    else
-        print_status "error" "$1 异常"
-        return 1
-    fi
-}
-
 # 检查依赖
 check_dependencies() {
     local missing_deps=()
@@ -53,8 +42,12 @@ check_dependencies() {
 # 检查 kubectl 是否可用
 check_kubectl() {
     echo -e "\n${YELLOW}[1] 检查 kubectl 连接状态${NC}"
-    kubectl get nodes &>/dev/null
-    check_status "kubectl 连接"
+    if kubectl get nodes &>/dev/null; then
+        print_status "success" "kubectl 连接正常"
+    else
+        print_status "error" "kubectl 连接失败"
+        exit 1
+    fi
 }
 
 # 检查 Kubernetes 版本
@@ -70,6 +63,7 @@ check_k8s_version() {
             print_status "success" "Kubernetes 集群版本 $SERVER_VERSION 符合要求（>= 1.24）"
         else
             print_status "error" "Kubernetes 集群版本 $SERVER_VERSION 低于要求的 1.24"
+            exit 1
         fi
     fi
 }
@@ -81,7 +75,7 @@ check_coredns() {
     # 检查 CoreDNS pods 状态
     if ! kubectl get pods -n kube-system -l k8s-app=kube-dns -o wide | grep Running &>/dev/null; then
         print_status "error" "CoreDNS Pod 未运行"
-        return 1
+        exit 1
     else
         print_status "success" "CoreDNS Pod 状态正常"
     fi
@@ -110,7 +104,7 @@ check_coredns() {
         echo "CoreDNS 配置信息:"
         kubectl get cm -n kube-system coredns -o yaml
         
-        return 1
+        exit 1
     fi
 }
 
@@ -121,6 +115,7 @@ check_apiserver() {
         print_status "success" "kube-apiserver 健康状态正常"
     else
         print_status "error" "kube-apiserver 健康状态异常"
+        exit 1
     fi
 }
 
@@ -181,16 +176,24 @@ check_network_plugin() {
             print_status "success" "Pod 外网连通性正常"
         else
             print_status "error" "Pod 无法访问外网"
+            exit 1
         fi
 
         # 测试集群内网络连通性，以 API Server 为例
         if kubectl exec $TEST_POD_NAME -- wget -q -T 3 -O - https://kubernetes.default.svc.cluster.local/healthz &>/dev/null; then
             print_status "success" "集群内网络连通性正常"
         else
-            print_status "error" "集群内网络连通性异常"
+            # 不验证证书
+            if kubectl exec $TEST_POD_NAME -- wget -q -T 3 -O - https://kubernetes.default.svc.cluster.local/healthz --no-check-certificate &>/dev/null; then
+                print_status "success" "集群内网络连通性正常"
+            else
+                print_status "error" "集群内网络连通性异常"
+                exit 1
+            fi
         fi
     else
         print_status "error" "网络测试 Pod 启动失败"
+        exit 1
     fi
 
     # 清理测试 Pod
@@ -212,6 +215,7 @@ check_container_runtime() {
         print_status "success" "容器运行时为 containerd"
     else
         print_status "error" "不支持 Docker 容器运行时的 Kubernetes 集群"
+        exit 1
     fi
 }
 
@@ -223,6 +227,7 @@ check_nodes() {
         print_status "success" "所有节点状态正常"
     else
         print_status "error" "存在 $NOT_READY_NODES 个节点状态异常"
+        exit 1
     fi
 }
 
