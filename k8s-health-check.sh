@@ -84,7 +84,7 @@ check_coredns() {
     local DNS_TEST_CMD="nslookup kubernetes.default.svc.cluster.local 2>&1"
     
     # 运行 DNS 测试
-    local DNS_RESULT=$(kubectl run -i --rm --restart=Never dns-test \
+    local DNS_RESULT=$(kubectl run -n default -i --rm --restart=Never dns-test \
         --image=registry.cn-hangzhou.aliyuncs.com/goodrain/busybox:latest \
         --command -- sh -c "$DNS_TEST_CMD")
     
@@ -123,13 +123,13 @@ check_apiserver() {
 check_network_plugin() {
     echo -e "\n${YELLOW}[5] 检查网络插件状态${NC}"
     
-    # 1. 首先通过节点信息判断网络插件类型
+    # 首先通过节点信息判断网络插件类型
     local CNI_INFO=$(kubectl get nodes -o jsonpath='{.items[*].spec.podCIDR}')
     if [ -z "$CNI_INFO" ]; then
         print_status "warning" "无法获取网络插件 CIDR 信息"
     fi
 
-    # 2. 检查 CNI 配置
+    # 检查 CNI 配置
     if [ -f "/etc/cni/net.d/10-flannel.conflist" ]; then
         local CNI_TYPE="Flannel"
     elif [ -f "/etc/cni/net.d/10-calico.conflist" ] || [ -f "/etc/cni/net.d/calico-kubeconfig" ]; then
@@ -141,7 +141,7 @@ check_network_plugin() {
     
     print_status "success" "检测到网络插件类型: $CNI_TYPE"
 
-    # 3. 检查网络插件 Pod 状态（搜索所有命名空间）
+    # 检查网络插件 Pod 状态（搜索所有命名空间）
     # Flannel 检查
     local FLANNEL_PODS=$(kubectl get pods --all-namespaces -l app=flannel 2>/dev/null)
     if [ -n "$FLANNEL_PODS" ]; then
@@ -162,44 +162,8 @@ check_network_plugin() {
         fi
     fi
 
-    # 4. 检查网络连通性
 
-    # 创建测试 Pod
-    local TEST_POD_NAME="network-test-$(date +%s)"
-    kubectl run $TEST_POD_NAME --image=registry.cn-hangzhou.aliyuncs.com/goodrain/busybox:latest --command -- sleep 30 &>/dev/null
-    sleep 5
-
-    # 等待 Pod 运行
-    if kubectl wait --for=condition=ready pod/$TEST_POD_NAME --timeout=30s &>/dev/null; then
-        # 测试 Pod 网络
-        if kubectl exec $TEST_POD_NAME -- ping -c 1 -W 3 8.8.8.8 &>/dev/null; then
-            print_status "success" "Pod 外网连通性正常"
-        else
-            print_status "error" "Pod 无法访问外网"
-            exit 1
-        fi
-
-        # 测试集群内网络连通性，以 API Server 为例
-        if kubectl exec $TEST_POD_NAME -- wget -q -T 3 -O - https://kubernetes.default.svc.cluster.local/healthz &>/dev/null; then
-            print_status "success" "集群内网络连通性正常"
-        else
-            # 不验证证书
-            if kubectl exec $TEST_POD_NAME -- wget -q -T 3 -O - https://kubernetes.default.svc.cluster.local/healthz --no-check-certificate &>/dev/null; then
-                print_status "success" "集群内网络连通性正常"
-            else
-                print_status "error" "集群内网络连通性异常"
-                exit 1
-            fi
-        fi
-    else
-        print_status "error" "网络测试 Pod 启动失败"
-        exit 1
-    fi
-
-    # 清理测试 Pod
-    kubectl delete pod $TEST_POD_NAME --force --grace-period=0 &>/dev/null
-
-    # 5. 检查 CNI 接口
+    # 检查 CNI 接口
     if ip link show | grep -q "flannel\|cni\|calico"; then
         print_status "success" "检测到 CNI 网络接口"
     else
@@ -207,9 +171,88 @@ check_network_plugin() {
     fi
 }
 
+# 检查网络连通性
+check_network_connectivity() {
+    echo -e "\n${YELLOW}[6] 检查网络连通性${NC}"
+
+    # 创建测试 Pod 和 Service
+    local TEST_NS="default"
+    local TEST_POD1="rbd-test-network-pod1-$(date +%m%d%M%S)"
+    local TEST_POD2="rbd-test-network-pod2-$(date +%m%d%M%S)"
+    local TEST_SVC="rbd-test-network-svc-$(date +%m%d%M%S)"
+
+    # 创建第一个 Pod（作为服务端，运行 nginx）
+    if kubectl run $TEST_POD1 -n $TEST_NS --image=registry.cn-hangzhou.aliyuncs.com/zqqq/nginx:alpine &>/dev/null; then
+        print_status "success" "创建测试 Pod($TEST_POD1) 成功"
+    else
+        print_status "error" "创建测试 Pod($TEST_POD1) 失败"
+        exit 1
+    fi
+
+    # 创建 Service
+    if kubectl expose pod $TEST_POD1 -n $TEST_NS --name=$TEST_SVC --port=80 &>/dev/null; then
+        print_status "success" "创建 Service($TEST_SVC) 成功"
+    else
+        print_status "error" "创建 Service($TEST_SVC) 失败"
+        exit 1
+    fi
+
+    # 创建第二个 Pod（作为客户端，运行 busybox）
+    if kubectl run $TEST_POD2 -n $TEST_NS --image=registry.cn-hangzhou.aliyuncs.com/goodrain/busybox:latest --command -- sleep 300 &>/dev/null; then
+        print_status "success" "创建测试 Pod($TEST_POD2) 成功"
+    else
+        print_status "error" "创建测试 Pod($TEST_POD2) 失败"
+        exit 1
+    fi
+
+    # 等待 Pod 就绪
+    print_status "success" "等待测试 Pod 就绪..."
+    kubectl wait --for=condition=ready pod/$TEST_POD1 -n $TEST_NS --timeout=30s &>/dev/null
+    kubectl wait --for=condition=ready pod/$TEST_POD2 -n $TEST_NS --timeout=30s &>/dev/null
+
+    # 测试 Pod 到外网的连通性
+    if kubectl exec -n $TEST_NS $TEST_POD2 -- ping -c 1 -W 3 8.8.8.8 &>/dev/null; then
+        print_status "success" "Pod 外网连通性正常"
+    else
+        print_status "error" "Pod 无法访问外网"
+        exit 1
+    fi
+
+    # 测试 Pod 间通信（通过 Service）
+    if kubectl exec -n $TEST_NS $TEST_POD2 -- wget -q -T 3 -O - http://$TEST_SVC.${TEST_NS}.svc.cluster.local &>/dev/null; then
+        print_status "success" "Pod 间网络通信正常"
+    else
+        print_status "error" "Pod 间网络通信异常"
+        exit 1
+    fi
+
+    # 清理资源
+    print_status "success" "正在清理测试资源..."
+    if kubectl delete pod $TEST_POD1 -n $TEST_NS --grace-period=0 --force &>/dev/null; then
+        print_status "success" "清理测试 Pod($TEST_POD1) 成功"
+    else
+        print_status "error" "清理测试 Pod($TEST_POD1) 失败"
+        exit 1
+    fi
+
+    if kubectl delete svc $TEST_SVC -n $TEST_NS --grace-period=0 --force &>/dev/null; then
+        print_status "success" "清理测试 Service($TEST_SVC) 成功"
+    else
+        print_status "error" "清理测试 Service($TEST_SVC) 失败"
+        exit 1
+    fi
+
+    if kubectl delete pod $TEST_POD2 -n $TEST_NS --grace-period=0 --force &>/dev/null; then
+        print_status "success" "清理测试 Pod($TEST_POD2) 成功"
+    else
+        print_status "error" "清理测试 Pod($TEST_POD2) 失败"
+        exit 1
+    fi
+}
+
 # 检查容器运行时
 check_container_runtime() {
-    echo -e "\n${YELLOW}[6] 检查容器运行时${NC}"
+    echo -e "\n${YELLOW}[7] 检查容器运行时${NC}"
     RUNTIME=$(kubectl get nodes -o wide | grep -v CONTAINER-RUNTIME | grep containerd)
     if kubectl get nodes -o wide | grep -v CONTAINER-RUNTIME | grep containerd &>/dev/null; then
         print_status "success" "容器运行时为 containerd"
@@ -221,7 +264,7 @@ check_container_runtime() {
 
 # 检查节点状态
 check_nodes() {
-    echo -e "\n${YELLOW}[7] 检查节点状态${NC}"
+    echo -e "\n${YELLOW}[8] 检查节点状态${NC}"
     NOT_READY_NODES=$(kubectl get nodes | grep -v "STATUS" | grep -v "Ready" | wc -l)
     if [ "$NOT_READY_NODES" -eq 0 ]; then
         print_status "success" "所有节点状态正常"
@@ -245,6 +288,7 @@ main() {
     check_coredns
     check_apiserver
     check_network_plugin
+    check_network_connectivity
     check_container_runtime
     check_nodes
 
